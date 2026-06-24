@@ -1,0 +1,804 @@
+<script>
+/* ==========================================================================
+   NoQs REGISTRY — FRONTEND CONTROLLER (COMPLETE + FIXED)
+   ========================================================================== */
+
+const AppState = {
+  students: [], subjects: [], settings: {},
+  role: (typeof _SERVER_ROLE !== 'undefined' && _SERVER_ROLE === 'editor') ? 'editor' : 'viewer',
+  activeView: 'dashboard',
+  filters: { name: '', id: '', subject: '', activeOnly: true },
+  sort: { key: 'student_id', dir: 'asc' },
+  formMode: 'add', editingId: null,
+  conflict: null,
+  importProposed: [],
+  charts: {},
+};
+
+/* ---------- SAFE UUID ---------- */
+function makeUuid() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch (e) { /* fall through */ }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+/* ---------- ASYNC WRAPPER ----------
+   CRITICAL: google.script.run is a special proxy — do NOT probe it with
+   typeof runner[fnName]. Just attach handlers and invoke directly.
+   A missing server function surfaces through withFailureHandler. */
+function callServer(fnName) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function(resolve, reject) {
+    if (typeof google === 'undefined' || !google.script || !google.script.run) {
+      return reject(new Error('google.script.run unavailable (not inside Apps Script).'));
+    }
+    var runner = google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(reject);
+    try {
+      runner[fnName].apply(runner, args);
+    } catch (e) {
+      reject(new Error('Could not invoke server function "' + fnName + '": ' + e.message));
+    }
+  });
+}
+
+/* ---------- TOAST ---------- */
+function showToast(message, type, ms) {
+  type = type || 'info';
+  ms = ms || 4000;
+  var container = document.getElementById('toast-container');
+  var el = document.createElement('div');
+  el.className = 'toast toast--' + type;
+  el.textContent = message;
+  container.appendChild(el);
+  setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, ms);
+}
+
+/* ---------- BOOTSTRAP ---------- */
+function initApp() {
+  applyRoleGating();  // runs immediately using _SERVER_ROLE — no waiting for async call
+  bindStaticEvents();
+  loadInitialData();  // will call applyRoleGating() again once server confirms; that's fine
+}
+
+/* ---------- LOAD DATA — single server call ----------
+   FIX: one combined call instead of three parallel calls.
+   service_getInitialData() must be added to Service.gs (see review notes). */
+function loadInitialData() {
+  renderTableSkeleton();
+  callServer('service_getInitialData')
+    .then(function(res) {
+      if (!res || !res.success) {
+        throw new Error((res && res.error) || 'Unknown server error');
+      }
+      AppState.students = Array.isArray(res.data.students) ? res.data.students : [];
+      AppState.subjects = Array.isArray(res.data.subjects) ? res.data.subjects : [];
+      AppState.settings = res.data.settings || {};
+      AppState.role     = res.data.role || 'viewer';   // ← NEW
+      applyRoleGating();                                // ← NEW
+      populateSubjectControls();
+      renderTable();
+      renderAnalytics();
+      showToast('Data loaded', 'success');
+    })
+    .catch(function(err) {
+      showToast('Failed to load data: ' + err.message, 'error');
+      renderTable();
+    });
+}
+
+/* ---------- RBAC: hide editing UI for viewers ---------- */
+function isEditor() { return AppState.role === 'editor'; }
+
+function applyRoleGating() {
+  var editor = isEditor();
+
+  // Body flag lets CSS hide things declaratively too (see Styles.html note).
+  document.body.classList.toggle('role-viewer', !editor);
+
+  // Header "Add Student" button
+  var addBtn = document.getElementById('btn-add');
+  if (addBtn) addBtn.classList.toggle('hidden', !editor);
+
+  // Sidebar + bottom-tab "Bulk Import" entries
+  document.querySelectorAll('[data-view="import"]').forEach(function(btn) {
+    btn.classList.toggle('hidden', !editor);
+  });
+
+  // If a viewer somehow lands on the import view, bounce them to dashboard
+  if (!editor && AppState.activeView === 'import') setView('dashboard');
+
+  // Re-render the table so per-row action buttons reflect the role
+  renderTable();
+}
+
+
+/* ---------- DATA-CHANGE HOOK ---------- */
+function refreshViews() { renderTable(); renderAnalytics(); }
+
+/* ---------- TABLE RENDERING ---------- */
+function getVisibleStudents() {
+  var name = AppState.filters.name;
+  var id = AppState.filters.id;
+  var subject = AppState.filters.subject;
+  var activeOnly = AppState.filters.activeOnly;
+
+  var rows = AppState.students.filter(function(s) {
+    if (activeOnly && !s.is_active) return false;
+    if (name && String(s.name).toLowerCase().indexOf(name.toLowerCase()) === -1) return false;
+    if (id && String(s.student_id).toLowerCase().indexOf(id.toLowerCase()) === -1) return false;
+    if (subject && s.subject_id !== subject) return false;
+    return true;
+  });
+
+  var key = AppState.sort.key;
+  var dir = AppState.sort.dir;
+  rows.sort(function(a, b) {
+    var av = a[key], bv = b[key];
+    if (typeof av === 'string') { av = av.toLowerCase(); bv = String(bv).toLowerCase(); }
+    if (av < bv) return dir === 'asc' ? -1 : 1;
+    if (av > bv) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+  return rows;
+}
+
+function renderTable() {
+  var tbody = document.getElementById('table-body');
+  var rows = getVisibleStudents();
+  document.getElementById('result-count').textContent =
+    rows.length + ' of ' + AppState.students.length;
+
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-cell">No records found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(function(s) {
+    return '<tr class="' + (s.is_active ? '' : 'row--inactive') + '">' +
+      '<td class="col-text mono">' + escapeHtml(s.student_id) + '</td>' +
+      '<td class="col-text">' + highlight(s.name, AppState.filters.name) + '</td>' +
+      '<td class="col-number">' + scoreDot(s.score_pct) + escapeHtml(String(s.score_pct)) + '%</td>' +
+      '<td class="col-text mono">' + escapeHtml(s.dob) + '</td>' +
+      '<td class="col-text"><span class="pill">' + escapeHtml(s.subject_id) + '</span></td>' +
+      '<td class="col-center"><span class="badge ' + (s.is_active ? 'badge--active' : 'badge--inactive') + '">' +
+        (s.is_active ? 'Active' : 'Inactive') + '</span></td>' +
+            '<td class="col-center">' +
+        (isEditor()
+          ? ('<button class="btn btn--mini" data-action="edit" data-id="' + s.student_id + '">Edit</button> ' +
+             (s.is_active
+               ? '<button class="btn btn--mini btn--danger" data-action="delete" data-id="' + s.student_id + '">Delete</button>'
+               : '<button class="btn btn--mini" data-action="restore" data-id="' + s.student_id + '">Restore</button>'))
+          : '<span class="muted">—</span>') +
+      '</td></tr>';
+
+  }).join('');
+}
+
+function renderTableSkeleton() {
+  var tbody = document.getElementById('table-body');
+  var rows = '';
+  for (var i = 0; i < 6; i++) {
+    rows += '<tr><td colspan="7"><div class="skeleton"></div></td></tr>';
+  }
+  tbody.innerHTML = rows;
+}
+
+function scoreDot(score) {
+  var risk  = Number(AppState.settings.AT_RISK_THRESHOLD || 50);
+  var amber = Number(AppState.settings.AMBER_THRESHOLD   || 70);
+  var cls   = score >= amber ? 'green' : score >= risk ? 'amber' : 'red';
+  return '<span class="dot dot--' + cls + '"></span>';
+}
+
+function populateSubjectControls() {
+  var opts = AppState.subjects.map(function(s) {
+    return '<option value="' + escapeHtml(s) + '">' + escapeHtml(s) + '</option>';
+  }).join('');
+  document.getElementById('f-subject').innerHTML =
+    '<option value="">Select subject...</option>' + opts;
+  document.getElementById('filter-subject').innerHTML =
+    '<option value="">All subjects</option>' + opts;
+}
+
+/* ==========================================================================
+   ANALYTICS
+   ========================================================================== */
+function computeAnalytics() {
+  var risk  = Number(AppState.settings.AT_RISK_THRESHOLD || 50);
+  var amber = Number(AppState.settings.AMBER_THRESHOLD   || 70);
+  var active = AppState.students.filter(function(s) { return s.is_active; });
+  var inactive = AppState.students.length - active.length;
+  var total = active.length;
+  var avg = total
+    ? active.reduce(function(a, s) { return a + Number(s.score_pct); }, 0) / total
+    : 0;
+  var top    = active.filter(function(s) { return s.score_pct >= amber; }).length;
+  var atRisk = active.filter(function(s) { return s.score_pct < risk; }).length;
+
+  var bySubject = {};
+  active.forEach(function(s) {
+    var k = s.subject_id || 'Unknown';
+    if (!bySubject[k]) bySubject[k] = { count: 0, sum: 0 };
+    bySubject[k].count++;
+    bySubject[k].sum += Number(s.score_pct);
+  });
+  var subjectLabels = Object.keys(bySubject).sort();
+  var subjectCounts = subjectLabels.map(function(k) { return bySubject[k].count; });
+  var subjectAvgs   = subjectLabels.map(function(k) {
+    return +(bySubject[k].sum / bySubject[k].count).toFixed(1);
+  });
+
+  var bands = {};
+  bands['At-risk (<' + risk + ')']               = active.filter(function(s) { return s.score_pct < risk; }).length;
+  bands['Mid (' + risk + '-' + (amber-1) + ')']  = active.filter(function(s) { return s.score_pct >= risk && s.score_pct < amber; }).length;
+  bands['Strong (' + amber + '+)']               = active.filter(function(s) { return s.score_pct >= amber; }).length;
+
+  var buckets = [0,0,0,0,0,0,0,0,0,0];
+  active.forEach(function(s) {
+    var i = Math.floor(Number(s.score_pct) / 10);
+    if (i > 9) i = 9; if (i < 0) i = 0;
+    buckets[i]++;
+  });
+  var bucketLabels = ['0-9','10-19','20-29','30-39','40-49','50-59','60-69','70-79','80-89','90-100'];
+
+  return { total: total, inactive: inactive, avg: avg, top: top, atRisk: atRisk,
+    risk: risk, amber: amber,
+    subjectLabels: subjectLabels, subjectCounts: subjectCounts, subjectAvgs: subjectAvgs,
+    bands: bands, buckets: buckets, bucketLabels: bucketLabels };
+}
+
+var CHART_COLORS = {
+  teal: '#0d9488', tealSoft: 'rgba(13,148,136,0.75)',
+  green: '#16a34a', amber: '#d97706', red: '#dc2626', blue: '#2563eb',
+  palette: ['#0d9488','#2563eb','#d97706','#16a34a','#dc2626','#7c3aed','#db2777','#0891b2','#65a30d','#ea580c'],
+};
+
+function renderAnalytics() {
+  if (typeof Chart === 'undefined') return;
+  var a = computeAnalytics();
+  var empty = document.getElementById('analytics-empty');
+
+  document.getElementById('stat-total').textContent = a.total;
+  document.getElementById('stat-total-sub').textContent =
+    a.inactive ? a.inactive + ' inactive (hidden)' : 'all active';
+  document.getElementById('stat-avg').textContent = a.avg.toFixed(1) + '%';
+  document.getElementById('stat-top').textContent = a.top;
+  document.getElementById('stat-risk').textContent = a.atRisk;
+  document.getElementById('stat-risk-sub').textContent = 'below ' + a.risk + '%';
+
+  if (a.total === 0) { empty.classList.remove('hidden'); destroyCharts(); return; }
+  empty.classList.add('hidden');
+
+  upsertChart('chart-subject', 'bar', {
+    labels: a.subjectLabels,
+    datasets: [{ label: 'Students', data: a.subjectCounts,
+      backgroundColor: CHART_COLORS.tealSoft, borderRadius: 6 }]
+  }, { plugins: { legend: { display: false } },
+       scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } });
+
+  upsertChart('chart-bands', 'doughnut', {
+    labels: Object.keys(a.bands),
+    datasets: [{ data: Object.values(a.bands),
+      backgroundColor: [CHART_COLORS.red, CHART_COLORS.amber, CHART_COLORS.green],
+      borderWidth: 2, borderColor: '#fff' }]
+  }, { plugins: { legend: { position: 'bottom' } }, cutout: '60%' });
+
+  upsertChart('chart-dist', 'bar', {
+    labels: a.bucketLabels,
+    datasets: [{ label: 'Students', data: a.buckets,
+      backgroundColor: a.bucketLabels.map(function(_, i) {
+        return i*10 >= a.amber ? CHART_COLORS.green : i*10 >= a.risk ? CHART_COLORS.amber : CHART_COLORS.red;
+      }),
+      borderRadius: 4 }]
+  }, { plugins: { legend: { display: false } },
+       scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } });
+
+  upsertChart('chart-avg-subject', 'bar', {
+    labels: a.subjectLabels,
+    datasets: [{ label: 'Avg score', data: a.subjectAvgs,
+      backgroundColor: a.subjectLabels.map(function(_, i) {
+        return CHART_COLORS.palette[i % CHART_COLORS.palette.length];
+      }),
+      borderRadius: 6 }]
+  }, { indexAxis: 'y', plugins: { legend: { display: false } },
+       scales: { x: { beginAtZero: true, max: 100 } } });
+}
+
+function upsertChart(canvasId, type, data, options) {
+  var baseOpts = Object.assign({ responsive: true, maintainAspectRatio: false,
+    animation: { duration: 350 } }, options);
+  if (AppState.charts[canvasId]) {
+    var c = AppState.charts[canvasId];
+    c.data = data; c.options = baseOpts; c.update();
+  } else {
+    var ctx = document.getElementById(canvasId).getContext('2d');
+    AppState.charts[canvasId] = new Chart(ctx, { type: type, data: data, options: baseOpts });
+  }
+}
+
+function destroyCharts() {
+  Object.keys(AppState.charts).forEach(function(k) { AppState.charts[k].destroy(); });
+  AppState.charts = {};
+}
+
+/* ---------- SEARCH HELPERS ---------- */
+function highlight(text, term) {
+  var safe = escapeHtml(String(text));
+  if (!term) return safe;
+  var re = new RegExp('(' + escapeRegex(term) + ')', 'ig');
+  return safe.replace(re, '<mark>$1</mark>');
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'": '&#39;' }[c];
+  });
+}
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/* ---------- CSV EXPORT ---------- */
+function toCsvValue(val) {
+  var s = (val === null || val === undefined) ? '' : String(val);
+  // Quote if the value contains comma, quote, or newline; escape inner quotes.
+  if (/[",\r\n]/.test(s)) {
+    s = '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function exportCsv() {
+  // Export exactly what the user currently sees (respects search/filter/sort).
+  var rows = getVisibleStudents();
+  if (rows.length === 0) {
+    showToast('Nothing to export with the current filters', 'warn');
+    return;
+  }
+
+  var headers = [
+    'student_id', 'name', 'score_pct', 'dob', 'subject_id',
+    'is_active', 'created_at', 'updated_at', 'row_version'
+  ];
+
+  var lines = [headers.map(toCsvValue).join(',')];
+  rows.forEach(function(s) {
+    lines.push(headers.map(function(h) { return toCsvValue(s[h]); }).join(','));
+  });
+
+  // Prepend UTF-8 BOM so Excel reads accented characters correctly.
+  var csv = '\uFEFF' + lines.join('\r\n');
+  var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  var url = URL.createObjectURL(blob);
+
+  var stamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'noqs-students-' + stamp + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  showToast('Exported ' + rows.length + ' students', 'success');
+}
+
+
+/* ---------- VIEW SWITCHING ---------- */
+function setView(view) {
+  AppState.activeView = view;
+  document.querySelectorAll('.view').forEach(function(v) {
+    v.classList.remove('view--active');
+  });
+  document.getElementById('view-' + view).classList.add('view--active');
+  document.querySelectorAll('[data-view]').forEach(function(btn) {
+    btn.classList.toggle('nav-btn--active', btn.dataset.view === view);
+    btn.classList.toggle('tab-btn--active', btn.dataset.view === view);
+  });
+  var titles = { dashboard: 'Student Records', analytics: 'Analytics Dashboard', import: 'AI Bulk Import' };
+  document.getElementById('header-title').textContent = titles[view] || 'NoQs Registry';
+  if (view === 'analytics') renderAnalytics();
+}
+
+/* ---------- FORM MODAL + DOB ---------- */
+function openForm(mode, student) {
+  AppState.formMode = mode;
+  AppState.editingId = student ? student.student_id : null;
+  document.getElementById('form-title').textContent = mode === 'add' ? 'Add Student' : 'Edit Student';
+  var f = document.getElementById('student-form');
+  f.reset();
+  if (student) {
+    f.elements['name'].value       = student.name;
+    f.elements['score_pct'].value  = student.score_pct;
+    f.elements['subject_id'].value = student.subject_id;
+    setDobSegments(student.dob);
+  } else {
+    setDobSegments('');
+  }
+  validateForm();
+  showModal('modal-form');
+}
+
+function setDobSegments(dobStr) {
+  var parts = (dobStr || '').split('/');
+  document.getElementById('dob-dd').value   = parts[0] || '';
+  document.getElementById('dob-mm').value   = parts[1] || '';
+  document.getElementById('dob-yyyy').value = parts[2] || '';
+}
+
+function getDobString() {
+  var dd   = document.getElementById('dob-dd').value.padStart(2, '0');
+  var mm   = document.getElementById('dob-mm').value.padStart(2, '0');
+  var yyyy = document.getElementById('dob-yyyy').value;
+  if (!dd.trim() || !mm.trim() || !yyyy.trim()) return '';
+  return dd + '/' + mm + '/' + yyyy;
+}
+
+function bindDobBehavior() {
+  var segIds = ['dob-dd', 'dob-mm', 'dob-yyyy'];
+  var segs   = segIds.map(function(id) { return document.getElementById(id); });
+  segs.forEach(function(seg, i) {
+    seg.addEventListener('input', function() {
+      seg.value = seg.value.replace(/\D/g, '');
+      if (seg.value.length >= Number(seg.maxLength) && i < segs.length - 1) {
+        segs[i + 1].focus();
+      }
+      validateForm();
+    });
+    seg.addEventListener('keydown', function(e) {
+      if (e.key === 'Backspace' && seg.value === '' && i > 0) segs[i - 1].focus();
+    });
+  });
+}
+
+function validateForm() {
+  var f = document.getElementById('student-form');
+  var errors = {};
+  var name = f.elements['name'].value.trim();
+  if (!name) errors.name = 'Name is required';
+  var score = Number(f.elements['score_pct'].value);
+  if (f.elements['score_pct'].value === '' || isNaN(score) || score < 0 || score > 100) {
+    errors.score_pct = 'Score must be 0–100';
+  }
+  if (!f.elements['subject_id'].value) errors.subject_id = 'Select a subject';
+  var dobErr = validateDob(getDobString());
+  if (dobErr) errors.dob = dobErr;
+
+  document.querySelectorAll('[data-error-for]').forEach(function(el) {
+    el.textContent = errors[el.dataset.errorFor] || '';
+  });
+  var ok = Object.keys(errors).length === 0;
+  document.getElementById('btn-submit-form').disabled = !ok;
+  return ok;
+}
+
+function validateDob(dobStr) {
+  if (!dobStr) return 'Date of birth is required';
+  var m = dobStr.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return 'Use DD/MM/YYYY';
+  var dd = +m[1], mm = +m[2], yyyy = +m[3];
+  var d = new Date(yyyy, mm - 1, dd);
+  if (d.getFullYear() !== yyyy || d.getMonth() !== mm - 1 || d.getDate() !== dd) return 'Not a real date';
+  if (d > new Date()) return 'Date cannot be in the future';
+  return null;
+}
+
+/* ---------- SUBMIT ---------- */
+function handleSubmit(e) {
+  e.preventDefault();
+  if (!validateForm()) return;
+  var f = document.getElementById('student-form');
+  var payload = {
+    name:       f.elements['name'].value.trim(),
+    score_pct:  Number(f.elements['score_pct'].value),
+    dob:        getDobString(),
+    subject_id: f.elements['subject_id'].value,
+  };
+  if (AppState.formMode === 'add') createStudent(payload);
+  else updateStudent(payload);
+}
+
+function createStudent(payload) {
+    if (!isEditor()) { showToast('View-only access — editing is disabled.', 'warn'); return; }
+
+  payload.idempotency_key = makeUuid();
+  closeModal('modal-form');
+  showToast('Saving...', 'info', 1500);
+  callServer('service_createStudent', payload)
+    .then(function(res) {
+      if (!res.success) { showToast(res.error || 'Create failed', 'error'); return; }
+      AppState.students.push(res.data);
+      refreshViews();
+      showToast('Student added', 'success');
+    })
+    .catch(function(err) { showToast('Server error: ' + err.message, 'error'); });
+}
+
+function updateStudent(payload) {
+    if (!isEditor()) { showToast('View-only access — editing is disabled.', 'warn'); return; }
+
+  var id  = AppState.editingId;
+  var idx = AppState.students.findIndex(function(s) { return s.student_id === id; });
+  if (idx === -1) return;
+  var original = Object.assign({}, AppState.students[idx]);
+  AppState.students[idx] = Object.assign({}, original, payload);
+  closeModal('modal-form');
+  refreshViews();
+  callServer('service_updateStudent', {
+    student_id:       id,
+    changes:          payload,
+    expected_version: original.row_version,
+  })
+    .then(function(res) {
+      if (!res.success) {
+        if (res.code === 'VERSION_CONFLICT') {
+          AppState.students[idx] = original; refreshViews();
+          openConflict(Object.assign({}, original, payload), res.data);
+          return;
+        }
+        AppState.students[idx] = original; refreshViews();
+        showToast(res.error || 'Update failed', 'error');
+        return;
+      }
+      AppState.students[idx] = res.data; refreshViews();
+      showToast('Saved', 'success');
+    })
+    .catch(function(err) {
+      AppState.students[idx] = original; refreshViews();
+      showToast('Server error: ' + err.message, 'error');
+    });
+}
+
+/* ---------- DELETE / RESTORE ---------- */
+function deleteStudent(id) {
+    if (!isEditor()) { showToast('View-only access — editing is disabled.', 'warn'); return; }
+
+  var idx = AppState.students.findIndex(function(s) { return s.student_id === id; });
+  if (idx === -1) return;
+  var original = Object.assign({}, AppState.students[idx]);
+  AppState.students[idx].is_active = false;
+  refreshViews();
+  showToast('Student removed', 'warn');
+  callServer('service_deleteStudent', { student_id: id })
+    .then(function(res) {
+      if (!res.success) { AppState.students[idx] = original; refreshViews(); showToast(res.error, 'error'); }
+    })
+    .catch(function(err) {
+      AppState.students[idx] = original; refreshViews();
+      showToast('Server error: ' + err.message, 'error');
+    });
+}
+
+function restoreStudent(id) {
+    if (!isEditor()) { showToast('View-only access — editing is disabled.', 'warn'); return; }
+
+  var idx = AppState.students.findIndex(function(s) { return s.student_id === id; });
+  if (idx === -1) return;
+  var original = Object.assign({}, AppState.students[idx]);
+  AppState.students[idx].is_active = true;
+  refreshViews();
+  callServer('service_restoreStudent', { student_id: id })
+    .then(function(res) {
+      if (!res.success) { AppState.students[idx] = original; refreshViews(); showToast(res.error, 'error'); }
+      else { AppState.students[idx] = res.data; refreshViews(); showToast('Restored', 'success'); }
+    })
+    .catch(function(err) {
+      AppState.students[idx] = original; refreshViews();
+      showToast('Server error: ' + err.message, 'error');
+    });
+}
+
+/* ---------- CONFLICT DIFF ---------- */
+function openConflict(yours, theirs) {
+  AppState.conflict = { yours: yours, theirs: theirs };
+  document.getElementById('conflict-yours').textContent   = JSON.stringify(prune(yours),  null, 2);
+  document.getElementById('conflict-theirs').textContent  = JSON.stringify(prune(theirs), null, 2);
+  showModal('modal-conflict');
+}
+function prune(s) {
+  return { name: s.name, score_pct: s.score_pct, dob: s.dob,
+           subject_id: s.subject_id, row_version: s.row_version };
+}
+function resolveConflictReload() {
+  var theirs = AppState.conflict.theirs;
+  var idx = AppState.students.findIndex(function(s) { return s.student_id === theirs.student_id; });
+  if (idx !== -1) AppState.students[idx] = theirs;
+  AppState.conflict = null;
+  closeModal('modal-conflict');
+  refreshViews();
+  showToast('Reloaded server version', 'info');
+}
+function resolveConflictForce() {
+  var yours  = AppState.conflict.yours;
+  var theirs = AppState.conflict.theirs;
+  closeModal('modal-conflict');
+  callServer('service_updateStudent', {
+    student_id:       theirs.student_id,
+    changes:          { name: yours.name, score_pct: yours.score_pct, dob: yours.dob, subject_id: yours.subject_id },
+    expected_version: theirs.row_version,
+  })
+    .then(function(res) {
+      if (res.success) {
+        var idx = AppState.students.findIndex(function(s) { return s.student_id === theirs.student_id; });
+        AppState.students[idx] = res.data; refreshViews();
+        showToast('Your version saved', 'success');
+      } else {
+        showToast(res.error || 'Force update failed', 'error');
+      }
+    })
+    .catch(function(err) { showToast('Server error: ' + err.message, 'error'); });
+  AppState.conflict = null;
+}
+
+/* ---------- AI BULK IMPORT ---------- */
+function parseImport() {
+    if (!isEditor()) { showToast('View-only access — editing is disabled.', 'warn'); return; }
+
+  var raw = document.getElementById('import-raw').value.trim();
+  if (!raw) { showToast('Paste some text first', 'warn'); return; }
+  showToast('Parsing with Gemini...', 'info', 2000);
+  callServer('ai_parseStudents', raw)
+    .then(function(res) {
+      if (!res.success) { showToast(res.error || 'Parse failed', 'error'); return; }
+      AppState.importProposed = res.data || [];
+      renderPreview();
+    })
+    .catch(function(err) { showToast('AI unavailable: ' + err.message, 'error'); });
+}
+
+function renderPreview() {
+  var wrap = document.getElementById('import-preview-wrap');
+  var body = document.getElementById('preview-body');
+  if (AppState.importProposed.length === 0) { wrap.classList.add('hidden'); return; }
+  body.innerHTML = AppState.importProposed.map(function(r, i) {
+    return '<tr>' +
+      '<td class="col-center"><input type="checkbox" data-preview-idx="' + i + '" checked /></td>' +
+      '<td>' + escapeHtml(r.name || '') + '</td>' +
+      '<td>' + escapeHtml(String(r.score_pct != null ? r.score_pct : '')) + '</td>' +
+      '<td class="mono">' + escapeHtml(r.dob || '') + '</td>' +
+      '<td><span class="pill">' + escapeHtml(r.subject_id || '') + '</span></td>' +
+      '</tr>';
+  }).join('');
+  wrap.classList.remove('hidden');
+}
+
+function confirmImport() {
+    if (!isEditor()) { showToast('View-only access — editing is disabled.', 'warn'); return; }
+
+  var checks   = document.querySelectorAll('[data-preview-idx]:checked');
+  var selected = Array.prototype.slice.call(checks).map(function(c) {
+    var row = AppState.importProposed[Number(c.dataset.previewIdx)];
+    return Object.assign({}, row, { idempotency_key: makeUuid() });
+  });
+  if (selected.length === 0) { showToast('Select at least one row', 'warn'); return; }
+  showToast('Importing ' + selected.length + ' rows...', 'info', 2000);
+  callServer('service_bulkCreateStudents', selected)
+    .then(function(res) {
+      if (!res.success) { showToast(res.error || 'Import failed', 'error'); return; }
+      (res.data.created || []).forEach(function(s) { AppState.students.push(s); });
+      refreshViews();
+      AppState.importProposed = [];
+      document.getElementById('import-preview-wrap').classList.add('hidden');
+      document.getElementById('import-raw').value = '';
+      setView('dashboard');
+      var errCount = (res.data.errors || []).length;
+      if (errCount > 0) {
+        showToast('Imported ' + res.data.createdCount + ', skipped ' + errCount + ' invalid row(s)', 'warn', 6000);
+        res.data.errors.forEach(function(e) { console.warn('Skipped row', e); });
+      } else {
+        showToast('Imported ' + res.data.createdCount + ' students', 'success');
+      }
+    })
+    .catch(function(err) { showToast('Server error: ' + err.message, 'error'); });
+}
+
+/* ---------- MODAL HELPERS ---------- */
+function showModal(id) { document.getElementById(id).classList.remove('hidden'); }
+function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+
+/* ==========================================================================
+   EVENT WIRING — bindStaticEvents()
+   FIX: was truncated mid-line in the original, causing a syntax error that
+   prevented the ENTIRE script from parsing — the root cause of all broken buttons.
+   ========================================================================== */
+function bindStaticEvents() {
+
+  /* --- Navigation --- */
+  document.querySelectorAll('[data-view]').forEach(function(btn) {
+    btn.addEventListener('click', function() { setView(btn.dataset.view); });
+  });
+
+  /* --- Header buttons --- */
+  document.getElementById('btn-add').addEventListener('click', function() { openForm('add'); });
+  document.getElementById('btn-refresh').addEventListener('click', loadInitialData);
+  document.getElementById('btn-export').addEventListener('click', exportCsv);
+
+  /* --- Toolbar filters --- */
+  document.getElementById('search-name').addEventListener('input', function(e) {
+    AppState.filters.name = e.target.value; renderTable();
+  });
+  document.getElementById('search-id').addEventListener('input', function(e) {
+    AppState.filters.id = e.target.value; renderTable();
+  });
+  document.getElementById('filter-subject').addEventListener('change', function(e) {
+    AppState.filters.subject = e.target.value; renderTable();
+  });
+  document.getElementById('filter-active-only').addEventListener('change', function(e) {
+    AppState.filters.activeOnly = e.target.checked; renderTable();
+  });
+
+  /* --- Sortable column headers --- */
+  document.querySelectorAll('.data-table th[data-sort]').forEach(function(th) {
+    th.addEventListener('click', function() {
+      var key = th.dataset.sort;
+      if (AppState.sort.key === key) {
+        AppState.sort.dir = AppState.sort.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        AppState.sort = { key: key, dir: 'asc' };
+      }
+      renderTable();
+    });
+  });
+
+  /* --- Table action buttons (edit / delete / restore) --- */
+  document.getElementById('table-body').addEventListener('click', function(e) {
+    var btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    var id      = btn.dataset.id;
+    var student = AppState.students.find(function(s) { return s.student_id === id; });
+    if (btn.dataset.action === 'edit')    openForm('edit', student);
+    if (btn.dataset.action === 'delete')  deleteStudent(id);
+    if (btn.dataset.action === 'restore') restoreStudent(id);
+  });
+
+  /* --- Add/Edit form --- */
+  var form = document.getElementById('student-form');
+  form.addEventListener('input',  validateForm);  // text inputs, number inputs
+  form.addEventListener('change', validateForm);  // FIX: <select> fires 'change', not 'input'
+  form.addEventListener('submit', handleSubmit);
+  bindDobBehavior();
+
+  /* --- Modal close buttons --- */
+  document.querySelectorAll('[data-close]').forEach(function(el) {
+    el.addEventListener('click', function() { closeModal(el.dataset.close); });
+  });
+
+  /* --- Conflict resolution --- */
+  document.getElementById('btn-conflict-reload').addEventListener('click', resolveConflictReload);
+  document.getElementById('btn-conflict-force').addEventListener('click', resolveConflictForce);
+
+  /* --- AI Bulk Import --- */
+  document.getElementById('btn-parse').addEventListener('click', parseImport);
+  document.getElementById('btn-clear-import').addEventListener('click', function() {
+    document.getElementById('import-raw').value = '';
+    AppState.importProposed = [];
+    document.getElementById('import-preview-wrap').classList.add('hidden');
+  });
+  document.getElementById('btn-confirm-import').addEventListener('click', confirmImport);
+
+  /* --- Preview select-all checkbox --- */
+  document.getElementById('preview-select-all').addEventListener('change', function(e) {
+    document.querySelectorAll('[data-preview-idx]').forEach(function(cb) {
+      cb.checked = e.target.checked;
+    });
+  });
+}
+
+/* ==========================================================================
+   BOOT
+   FIX 1: Script.html is injected at the bottom of <body> via include().
+   By the time this inline script executes, the DOM is already fully built.
+   DOMContentLoaded may have already fired, so we call initApp() directly.
+
+   FIX 2: The original file was truncated (cut off at 'btn-conflict'),
+   causing a JS syntax error that prevented the ENTIRE script from parsing —
+   which is why no button worked at all.
+   ========================================================================== */
+initApp();
+</script>
