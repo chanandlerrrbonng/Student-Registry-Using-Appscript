@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NoQs Registry</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js for the analytics dashboard -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <?!= include('Styles'); ?>
+</head>
+
+<body>
+  <div id="app-shell" class="app-shell">
+
+    <!-- ---------- SIDEBAR ---------- -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar__brand">
+        <span class="sidebar__logo">NQ</span>
+        <span>NoQs Registry</span>
+      </div>
+      <nav class="sidebar__nav">
+        <button class="nav-btn nav-btn--active" data-view="dashboard">
+          <span class="nav-ico">▦</span> Records
+        </button>
+        <button class="nav-btn" data-view="analytics">
+          <span class="nav-ico">◔</span> Analytics
+        </button>
+        <button class="nav-btn hidden" data-view="import">
+          <span class="nav-ico">⤓</span> Bulk Import
+        </button>
+      </nav>
+      <div class="sidebar__footer">Apps Script · Sheets</div>
+    </aside>
+
+    <!-- ---------- HEADER BAR ---------- -->
+    <header id="header" class="header">
+      <h1 class="header__title" id="header-title">Student Records</h1>
+      <div class="header__actions">
+  <button id="btn-export" class="btn btn--ghost">⬇ Export CSV</button>
+  <button id="btn-refresh" class="btn btn--ghost">↻ Refresh</button>
+  <button id="btn-add" class="btn btn--primary hidden">+ Add Student</button>
+</div>
+
+    </header>
+
+    <!-- ---------- MAIN CONTENT ---------- -->
+    <main id="main" class="main">
+
+      <!-- ============= VIEW: DASHBOARD ============= -->
+      <section id="view-dashboard" class="view view--active">
+        <div class="toolbar">
+          <div class="toolbar__search">
+            <input type="text" id="search-name" class="input" placeholder="Search name..." />
+            <input type="text" id="search-id" class="input" placeholder="Search ID..." />
+          </div>
+          <select id="filter-subject" class="input input--select">
+            <option value="">All subjects</option>
+          </select>
+          <label class="toolbar__chk">
+            <input type="checkbox" id="filter-active-only" checked />
+            <span>Active only</span>
+          </label>
+          <span id="result-count" class="toolbar__count"></span>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th class="col-text" data-sort="student_id">Student ID</th>
+                <th class="col-text" data-sort="name">Name</th>
+                <th class="col-number" data-sort="score_pct">Score</th>
+                <th class="col-text" data-sort="dob">DOB</th>
+                <th class="col-text" data-sort="subject_id">Subject</th>
+                <th class="col-center" data-sort="is_active">Status</th>
+                <th class="col-center">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============= VIEW: ANALYTICS ============= -->
+      <section id="view-analytics" class="view">
+        <div class="stat-grid">
+          <div class="stat-card">
+            <span class="stat-card__label">Total Students</span>
+            <span class="stat-card__value" id="stat-total">—</span>
+            <span class="stat-card__sub" id="stat-total-sub"></span>
+          </div>
+          <div class="stat-card stat-card--green">
+            <span class="stat-card__label">Average Score</span>
+            <span class="stat-card__value" id="stat-avg">—</span>
+            <span class="stat-card__sub">across active students</span>
+          </div>
+          <div class="stat-card stat-card--amber">
+            <span class="stat-card__label">Top Performers</span>
+            <span class="stat-card__value" id="stat-top">—</span>
+            <span class="stat-card__sub">scoring 70%+</span>
+          </div>
+          <div class="stat-card stat-card--red">
+            <span class="stat-card__label">At-Risk</span>
+            <span class="stat-card__value" id="stat-risk">—</span>
+            <span class="stat-card__sub" id="stat-risk-sub">below threshold</span>
+          </div>
+        </div>
+
+        <div class="chart-grid">
+          <div class="chart-card chart-card--wide">
+            <h3 class="chart-card__title">Students per Subject</h3>
+            <div class="chart-box"><canvas id="chart-subject"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3 class="chart-card__title">Performance Bands</h3>
+            <div class="chart-box"><canvas id="chart-bands"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3 class="chart-card__title">Score Distribution</h3>
+            <div class="chart-box"><canvas id="chart-dist"></canvas></div>
+          </div>
+          <div class="chart-card chart-card--wide">
+            <h3 class="chart-card__title">Average Score by Subject</h3>
+            <div class="chart-box"><canvas id="chart-avg-subject"></canvas></div>
+          </div>
+        </div>
+
+        <div id="analytics-empty" class="analytics-empty hidden">
+          No active student data to analyse yet. Add some records first.
+        </div>
+      </section>
+
+      <!-- ============= VIEW: BULK IMPORT (AI) ============= -->
+      <section id="view-import" class="view">
+        <div class="import-panel">
+          <h2 class="import-panel__title">AI Bulk Import</h2>
+          <p class="import-panel__hint">
+            Paste any text (notes, CSV, messages). Gemini parses it into rows — nothing is saved until you confirm.
+          </p>
+          <textarea id="import-raw" class="textarea" rows="6"
+            placeholder="Paste student data here..."></textarea>
+          <div class="import-panel__actions">
+            <button id="btn-parse" class="btn btn--primary">Parse with Gemini</button>
+            <button id="btn-clear-import" class="btn btn--ghost">Clear</button>
+          </div>
+
+          <div id="import-preview-wrap" class="hidden">
+            <h3 class="import-panel__subtitle">Preview — review before importing</h3>
+            <div class="table-wrap">
+              <table class="data-table data-table--preview">
+                <thead>
+                  <tr>
+                    <th class="col-center"><input type="checkbox" id="preview-select-all" checked /></th>
+                    <th>Name</th><th>Score</th><th>DOB</th><th>Subject</th>
+                  </tr>
+                </thead>
+                <tbody id="preview-body"></tbody>
+              </table>
+            </div>
+            <button id="btn-confirm-import" class="btn btn--primary" style="margin-top:14px;">
+              Import Selected Rows
+            </button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- ---------- MOBILE BOTTOM TAB BAR ---------- -->
+    <nav id="bottom-tabs" class="bottom-tabs">
+      <button class="tab-btn tab-btn--active" data-view="dashboard">Records</button>
+      <button class="tab-btn" data-view="analytics">Analytics</button>
+      <button class="tab-btn hidden" data-view="import">Import</button>
+    </nav>
+  </div>
+
+  <!-- MODAL: ADD / EDIT STUDENT -->
+  <div id="modal-form" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal__backdrop" data-close="modal-form"></div>
+    <div class="modal__panel">
+      <h2 id="form-title" class="modal__title">Add Student</h2>
+      <form id="student-form" class="form" novalidate>
+        <label class="field">
+          <span class="field__label">Name</span>
+          <input type="text" name="name" id="f-name" class="input" required />
+          <span class="field__error" data-error-for="name"></span>
+        </label>
+        <label class="field">
+          <span class="field__label">Score (%)</span>
+          <input type="number" name="score_pct" id="f-score" class="input"
+            min="0" max="100" step="0.01" required />
+          <span class="field__error" data-error-for="score_pct"></span>
+        </label>
+        <div class="field">
+          <span class="field__label">Date of Birth</span>
+          <div class="dob-group" id="dob-group">
+            <input type="text" inputmode="numeric" id="dob-dd" class="dob-seg" maxlength="2" placeholder="DD" data-seg="dd" />
+            <span class="dob-sep">/</span>
+            <input type="text" inputmode="numeric" id="dob-mm" class="dob-seg" maxlength="2" placeholder="MM" data-seg="mm" />
+            <span class="dob-sep">/</span>
+            <input type="text" inputmode="numeric" id="dob-yyyy" class="dob-seg dob-seg--year" maxlength="4" placeholder="YYYY" data-seg="yyyy" />
+          </div>
+          <span class="field__error" data-error-for="dob"></span>
+        </div>
+        <label class="field">
+          <span class="field__label">Subject</span>
+          <select name="subject_id" id="f-subject" class="input input--select" required>
+            <option value="">Select subject...</option>
+          </select>
+          <span class="field__error" data-error-for="subject_id"></span>
+        </label>
+        <div class="modal__actions">
+          <button type="button" class="btn btn--ghost" data-close="modal-form">Cancel</button>
+          <button type="submit" id="btn-submit-form" class="btn btn--primary" disabled>Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: VERSION CONFLICT DIFF -->
+  <div id="modal-conflict" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal__backdrop"></div>
+    <div class="modal__panel modal__panel--wide">
+      <h2 class="modal__title">Version Conflict</h2>
+      <p class="modal__hint">Someone edited this record while you were working. Choose which version to keep.</p>
+      <div class="diff">
+        <div class="diff__col">
+          <h3>Your Changes</h3>
+          <pre id="conflict-yours" class="diff__pre"></pre>
+        </div>
+        <div class="diff__col">
+          <h3>Current (Server)</h3>
+          <pre id="conflict-theirs" class="diff__pre"></pre>
+        </div>
+      </div>
+      <div class="modal__actions">
+        <button id="btn-conflict-reload" class="btn btn--ghost">Discard Mine / Reload</button>
+        <button id="btn-conflict-force" class="btn btn--primary">Overwrite With Mine</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <script>
+    var _SERVER_ROLE  = '<?= initialRole  ?>';
+    var _SERVER_EMAIL = '<?= initialEmail ?>';
+  </script>
+  <?!= include('Script'); ?>
+</body>
+</html>
